@@ -154,7 +154,7 @@ class EnglishWordRule(MoveRule):
 
 def is_task_already_processed(task, service: TodoistService) -> bool:
   """Check if task has already been processed by the bot"""
-  if task.comment_count == 0:
+  if True or task.comment_count == 0: # Disable this check for now
     return False
 
   comments = service.get_task_comments(task.id)
