@@ -59,20 +59,36 @@ class TodoistService:
     return projects.get(project_name.lower())
 
   def get_tasks(self) -> List:
-    """Fetch all active tasks"""
+    """Fetch all active inbox tasks"""
     try:
-      tasks_iterator = self.api.filter_tasks(
-        query="#inbox & search: english"
-      )
+      tasks_iterator = self.api.filter_tasks(query="#inbox")
       all_tasks = []
       for task_list in tasks_iterator:
         all_tasks.extend(task_list)
       return all_tasks
-
-
     except Exception as e:
       logger.error(f"Failed to fetch tasks: {e}")
       return []
+
+  def get_section_id(self, project_id: str, section_name: str) -> Optional[str]:
+    """Look up section_id by name in project_id (case-insensitive). Never creates sections."""
+    if not hasattr(self, '_sections_cache'):
+      self._sections_cache = {}
+    cache_key = (project_id, section_name.lower())
+    if cache_key not in self._sections_cache:
+      try:
+        sections = []
+        for sl in self.api.get_sections(project_id=project_id):
+          sections.extend(sl)
+        for s in sections:
+          self._sections_cache[(project_id, s.name.lower())] = s.id
+      except Exception as e:
+        logger.error(f"Failed to fetch sections for project {project_id}: {e}")
+        return None
+      if cache_key not in self._sections_cache:
+        logger.warning(f"Section '{section_name}' not found in project {project_id}. Moving to project root.")
+        return None
+    return self._sections_cache[cache_key]
 
   def get_task_comments(self, task_id: str) -> List:
     """Fetch comments for a task"""
@@ -82,10 +98,10 @@ class TodoistService:
       logger.error(f"Failed to fetch comments for task {task_id}: {e}")
       return []
 
-  def move_task(self, task_id: str, project_id: str) -> bool:
-    """Move task to a different project"""
+  def move_task(self, task_id: str, project_id: str, section_id: Optional[str] = None) -> bool:
+    """Move task to a different project (and optional section)"""
     try:
-      self.api.move_task(task_id=task_id, project_id=project_id)
+      self.api.move_task(task_id=task_id, project_id=project_id, section_id=section_id)
       return True
     except Exception as e:
       logger.error(f"Failed to move task {task_id}: {e}")
@@ -115,41 +131,59 @@ class TaskRule(ABC):
 
 
 class MoveRule(TaskRule):
-  """Base class for rules that move tasks to a specific project"""
+  """Base class for rules that move tasks to a specific project (and optional section)"""
 
-  def __init__(self, target_project_name: str):
+  def __init__(self, target_project_name: str, target_section_name: Optional[str] = None):
     self.target_project_name = target_project_name
+    self.target_section_name = target_section_name
+
+  def _section_name_for(self, task_content: str) -> Optional[str]:
+    """Return the section name for this task. Override in subclasses for per-task routing."""
+    return self.target_section_name
 
   def execute(self, task, service: TodoistService) -> bool:
-    """Move the task to the target project"""
+    """Move the task to the target project (and section if specified)"""
     project_id = service.get_project_id(self.target_project_name)
 
     if not project_id:
       logger.warning(f"Project '{self.target_project_name}' not found. Skipping move.")
       return False
 
+    section_id = None
+    section_name = self._section_name_for(task.content)
+    if section_name:
+      section_id = service.get_section_id(project_id, section_name)
+      # get_section_id logs a warning if not found; we proceed to project root
+
     # Move the task
-    if not service.move_task(task.id, project_id):
+    if not service.move_task(task.id, project_id, section_id=section_id):
       return False
 
     # Add comment
     rule_name = self.__class__.__name__
-    message = f"Moved to '{self.target_project_name}' by {rule_name}"
+    dest = f"'{self.target_project_name}'"
+    if section_name:
+      dest += f" / {section_name}"
+    message = f"Moved to {dest} by {rule_name}"
     service.add_comment(task.id, message)
 
-    logger.info(f"✓ {rule_name}: Moved '{task.content}' → {self.target_project_name}")
+    logger.info(f"✓ {rule_name}: Moved '{task.content}' → {dest}")
     return True
 
 
-class EnglishWordRule(MoveRule):
-  """Move tasks starting with 'english' to 'english-words' project"""
 
-  def __init__(self):
-    super().__init__(target_project_name="english-words")
+class PrefixMoveRule(MoveRule):
+  """Config-driven rule: move tasks whose content starts with any of the given prefixes"""
+
+  def __init__(self, prefix: str, target_project_name: str,
+               target_section_name: Optional[str] = None):
+    super().__init__(target_project_name=target_project_name,
+                     target_section_name=target_section_name)
+    self.prefix = prefix.lower()
 
   def matches(self, task_content: str) -> bool:
-    """Check if task starts with 'english' (case-insensitive)"""
-    return task_content.lower().startswith("english")
+    return task_content.lower().startswith(self.prefix)
+
 
 
 def is_task_already_processed(task, service: TodoistService) -> bool:
@@ -172,9 +206,15 @@ def main():
     logger.critical(f"Failed to initialize: {e}")
     sys.exit(1)
 
-  # Define active rules
+  # Define active rules (first match wins)
   rules: List[TaskRule] = [
-    EnglishWordRule(),
+    PrefixMoveRule("english",  "english-words"),
+    PrefixMoveRule("feedback", "Feedback/retro"),
+    PrefixMoveRule("idea",     "Ideas"),
+    PrefixMoveRule("book",     "Fun/entertainment", target_section_name="Books"),
+    PrefixMoveRule("movie",    "Fun/entertainment", target_section_name="Movies"),
+    PrefixMoveRule("game",     "Fun/entertainment", target_section_name="Games"),
+    PrefixMoveRule("hobby",    "Fun/entertainment", target_section_name="Hobby"),
   ]
 
   # Fetch tasks
