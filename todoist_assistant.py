@@ -6,6 +6,7 @@ Story 1: Move tasks starting with "english" to "english-words" project
 import os
 import logging
 import sys
+from datetime import datetime, timedelta, timezone
 from abc import ABC, abstractmethod
 from typing import List, Optional
 
@@ -25,6 +26,7 @@ load_dotenv()
 
 # Constants
 BOT_SIGNATURE = "🤖 processed"
+DRY_RUN = "--dry-run" in sys.argv
 
 
 class TodoistService:
@@ -100,6 +102,8 @@ class TodoistService:
 
   def move_task(self, task_id: str, project_id: str, section_id: Optional[str] = None) -> bool:
     """Move task to a different project (and optional section)"""
+    if DRY_RUN:
+      return True
     try:
       self.api.move_task(task_id=task_id, project_id=project_id, section_id=section_id)
       return True
@@ -109,6 +113,8 @@ class TodoistService:
 
   def add_comment(self, task_id: str, message: str):
     """Add a comment to a task"""
+    if DRY_RUN:
+      return
     try:
       comment = f"{BOT_SIGNATURE}: {message}"
       self.api.add_comment(task_id=task_id, content=comment)
@@ -120,7 +126,7 @@ class TaskRule(ABC):
   """Abstract base class for task processing rules"""
 
   @abstractmethod
-  def matches(self, task_content: str) -> bool:
+  def matches(self, task) -> bool:
     """Check if this rule applies to the task"""
     pass
 
@@ -181,8 +187,24 @@ class PrefixMoveRule(MoveRule):
                      target_section_name=target_section_name)
     self.prefix = prefix.lower()
 
-  def matches(self, task_content: str) -> bool:
-    return task_content.lower().startswith(self.prefix)
+  def matches(self, task) -> bool:
+    return task.content.lower().startswith(self.prefix)
+
+
+class StaleMoveRule(MoveRule):
+  """Move inbox tasks older than max_age_days, unless they have a due date or a label"""
+
+  def __init__(self, max_age_days: int, target_project_name: str):
+    super().__init__(target_project_name=target_project_name)
+    self.max_age = timedelta(days=max_age_days)
+
+  def matches(self, task) -> bool:
+    if task.due or task.labels:
+      return False
+    created_at = task.created_at
+    if created_at.tzinfo is None:
+      created_at = created_at.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - created_at > self.max_age
 
 
 
@@ -197,7 +219,7 @@ def is_task_already_processed(task, service: TodoistService) -> bool:
 
 def main():
   """Main execution loop"""
-  logger.info("Starting Todoist Assistant...")
+  logger.info("Starting Todoist Assistant..." + (" (dry run: nothing is moved)" if DRY_RUN else ""))
 
   # Initialize service
   try:
@@ -215,6 +237,7 @@ def main():
     PrefixMoveRule("movie",    "Fun/entertainment", target_section_name="Movies"),
     PrefixMoveRule("game",     "Fun/entertainment", target_section_name="Games"),
     PrefixMoveRule("hobby",    "Fun/entertainment", target_section_name="Hobby"),
+    StaleMoveRule(30, "Inbox Stale"),  # keep last: only tasks no other rule took
   ]
 
   # Fetch tasks
@@ -234,7 +257,7 @@ def main():
     # Try to match against rules
     rule_matched = False
     for rule in rules:
-      if rule.matches(task.content):
+      if rule.matches(task):
         logger.info(f"Processing: {task.content}")
         success = rule.execute(task, service)
         if success:
